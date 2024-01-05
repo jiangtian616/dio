@@ -26,6 +26,7 @@ class DioForBrowser with DioMixin implements Dio {
     Map<String, dynamic>? queryParameters,
     CancelToken? cancelToken,
     bool deleteOnError = true,
+    bool shouldAppendFile = false,
     String lengthHeader = Headers.contentLengthHeader,
     Object? data,
     Options? options,
