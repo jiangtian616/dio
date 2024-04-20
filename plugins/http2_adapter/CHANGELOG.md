@@ -2,9 +2,25 @@
 
 ## Unreleased
 
+*None.*
+
+## 2.5.2
+
+- Remove client stream termination in `Http2Adapter`.
+
+## 2.5.1
+
+- Wrap `SocketException` in `DioExceptionType.connectionError`
+  instead of `DioExceptionType.unknown`.
+
+## 2.5.0
+
 - Fix cancellation for streamed responses and downloads.
 - Fix progress for streamed responses and downloads.
 - Bump minimum Dart SDK to 3.0.0 as required by the `http2` package.
+- Allows `HTTP/1.0` when connecting to proxies.
+- Add the ability to use a fallback `HttpClientAdapter`
+  when HTTP/2 is unavailable for the current request.
 
 ## 2.4.0
 

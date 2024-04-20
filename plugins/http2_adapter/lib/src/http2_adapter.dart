@@ -4,7 +4,9 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:http2/http2.dart';
+import 'package:meta/meta.dart';
 
 part 'client_setting.dart';
 
@@ -12,13 +14,31 @@ part 'connection_manager.dart';
 
 part 'connection_manager_imp.dart';
 
+/// The signature of [Http2Adapter.onNotSupported].
+typedef H2NotSupportedCallback = Future<ResponseBody> Function(
+  RequestOptions options,
+  Stream<Uint8List>? requestStream,
+  Future<void>? cancelFuture,
+  DioH2NotSupportedException exception,
+);
+
 /// A Dio HttpAdapter which implements Http/2.0.
 class Http2Adapter implements HttpClientAdapter {
   Http2Adapter(
-    ConnectionManager? connectionManager,
-  ) : _connectionMgr = connectionManager ?? ConnectionManager();
+    ConnectionManager? connectionManager, {
+    HttpClientAdapter? fallbackAdapter,
+    this.onNotSupported,
+  })  : connectionManager = connectionManager ?? ConnectionManager(),
+        fallbackAdapter = fallbackAdapter ?? IOHttpClientAdapter();
 
-  final ConnectionManager _connectionMgr;
+  /// {@macro dio_http2_adapter.ConnectionManager}
+  ConnectionManager connectionManager;
+
+  /// {@macro dio.HttpClientAdapter}
+  HttpClientAdapter fallbackAdapter;
+
+  /// Handles [DioH2NotSupportedException] and returns a [ResponseBody].
+  H2NotSupportedCallback? onNotSupported;
 
   @override
   Future<ResponseBody> fetch(
@@ -26,13 +46,39 @@ class Http2Adapter implements HttpClientAdapter {
     Stream<Uint8List>? requestStream,
     Future<void>? cancelFuture,
   ) async {
+    // Recursive fetching.
     final redirects = <RedirectRecord>[];
-    return _fetch(
-      options,
-      requestStream,
-      cancelFuture,
-      redirects,
-    );
+    try {
+      return await _fetch(options, requestStream, cancelFuture, redirects);
+    } on DioH2NotSupportedException catch (e) {
+      // Fallback to use the callback
+      // or to another adapter (typically IOHttpClientAdapter)
+      // since the request can have a better handle by it.
+      if (onNotSupported != null) {
+        return await onNotSupported!(options, requestStream, cancelFuture, e);
+      }
+      return await fallbackAdapter.fetch(options, requestStream, cancelFuture);
+    } on SocketException catch (e) {
+      if (e.message.contains('timed out')) {
+        final Duration effectiveTimeout;
+        if (options.connectTimeout != null &&
+            options.connectTimeout! > Duration.zero) {
+          effectiveTimeout = options.connectTimeout!;
+        } else {
+          effectiveTimeout = Duration.zero;
+        }
+        throw DioException.connectionTimeout(
+          requestOptions: options,
+          timeout: effectiveTimeout,
+          error: e,
+        );
+      }
+      throw DioException.connectionError(
+        requestOptions: options,
+        reason: e.message,
+        error: e,
+      );
+    }
   }
 
   Future<ResponseBody> _fetch(
@@ -41,7 +87,7 @@ class Http2Adapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
     List<RedirectRecord> redirects,
   ) async {
-    final transport = await _connectionMgr.getConnection(options);
+    final transport = await connectionManager.getConnection(options);
     final uri = options.uri;
     String path = uri.path;
     const excludeMethods = ['PUT', 'POST', 'PATCH'];
@@ -77,22 +123,21 @@ class Http2Adapter implements HttpClientAdapter {
     // Creates a new outgoing stream.
     final stream = transport.makeRequest(headers);
 
-    // ignore: unawaited_futures
-    cancelFuture?.whenComplete(() {
-      Future(() {
-        stream.terminate();
+    final hasRequestData = requestStream != null;
+    if (hasRequestData) {
+      cancelFuture?.whenComplete(() {
+        stream.outgoingMessages.close();
       });
-    });
+    }
 
     List<Uint8List>? list;
-    final hasRequestData = requestStream != null;
     if (!excludeMethods.contains(options.method) && hasRequestData) {
       list = await requestStream.toList();
       requestStream = Stream.fromIterable(list);
     }
 
     if (hasRequestData) {
-      Future<void> requestStreamFuture = requestStream!.listen((data) {
+      Future<dynamic> requestStreamFuture = requestStream!.listen((data) {
         stream.outgoingMessages.add(DataStreamMessage(data));
       }).asFuture();
       final sendTimeout = options.sendTimeout ?? Duration.zero;
@@ -100,7 +145,7 @@ class Http2Adapter implements HttpClientAdapter {
         requestStreamFuture = requestStreamFuture.timeout(
           sendTimeout,
           onTimeout: () {
-            stream.terminate();
+            stream.outgoingMessages.close().catchError((_) {});
             throw DioException.sendTimeout(
               timeout: sendTimeout,
               requestOptions: options,
@@ -114,7 +159,7 @@ class Http2Adapter implements HttpClientAdapter {
 
     final responseSink = StreamController<Uint8List>();
     final responseHeaders = Headers();
-    final responseCompleter = Completer<void>();
+    final responseCompleter = Completer();
     late StreamSubscription responseSubscription;
     bool needRedirect = false;
     bool needResponse = false;
@@ -150,7 +195,6 @@ class Http2Adapter implements HttpClientAdapter {
             );
           } else {
             responseSubscription.cancel().whenComplete(() {
-              stream.terminate();
               responseSink.close();
             });
           }
@@ -159,7 +203,7 @@ class Http2Adapter implements HttpClientAdapter {
       onError: (Object error, StackTrace stackTrace) {
         // If connection is being forcefully terminated, remove the connection.
         if (error is TransportConnectionException) {
-          _connectionMgr.removeConnection(transport);
+          connectionManager.removeConnection(transport);
         }
         if (!responseCompleter.isCompleted) {
           responseCompleter.completeError(error, stackTrace);
@@ -176,14 +220,15 @@ class Http2Adapter implements HttpClientAdapter {
       cancelOnError: true,
     );
 
-    Future<void> responseFuture = responseCompleter.future;
+    Future<dynamic> responseFuture = responseCompleter.future;
     if (receiveTimeout > Duration.zero) {
       responseFuture = responseFuture.timeout(
         receiveTimeout,
         onTimeout: () {
           responseSubscription
               .cancel()
-              .whenComplete(() => responseSink.close());
+              .catchError((_) {})
+              .whenComplete(() => responseSink.close().catchError((_) {}));
           throw DioException.receiveTimeout(
             timeout: receiveTimeout,
             requestOptions: options,
@@ -195,12 +240,29 @@ class Http2Adapter implements HttpClientAdapter {
 
     // Handle redirection.
     if (needRedirect) {
+      if (responseHeaders['location'] == null) {
+        // Redirect without location is illegal.
+        throw DioException.connectionError(
+          requestOptions: options,
+          reason: 'Received redirect without location header.',
+        );
+      }
       final url = responseHeaders.value('location');
+      // An empty `location` header is considered a self redirect.
+      final uri = Uri.parse(url ?? '');
       redirects.add(
-        RedirectRecord(statusCode, options.method, Uri.parse(url ?? '')),
+        RedirectRecord(
+          statusCode,
+          options.method,
+          uri,
+        ),
       );
+      final String path = resolveRedirectUri(options.uri, uri);
       return _fetch(
-        options.copyWith(path: url, maxRedirects: --options.maxRedirects),
+        options.copyWith(
+          path: path,
+          maxRedirects: --options.maxRedirects,
+        ),
         list != null ? Stream.fromIterable(list) : null,
         cancelFuture,
         redirects,
@@ -215,7 +277,7 @@ class Http2Adapter implements HttpClientAdapter {
       onClose: () {
         responseSubscription.cancel();
         responseSink.close();
-        stream.terminate();
+        stream.outgoingMessages.close();
       },
     );
   }
@@ -227,8 +289,53 @@ class Http2Adapter implements HttpClientAdapter {
         statusCodes.contains(status);
   }
 
+  @visibleForTesting
+  static String resolveRedirectUri(Uri currentUri, Uri redirectUri) {
+    if (redirectUri.hasScheme) {
+      /// This is a full URL which has to be redirected to as is.
+      return redirectUri.toString();
+    }
+
+    /// This is relative with or without leading slash and is
+    /// resolved against the URL of the original request.
+    return currentUri.resolveUri(redirectUri).toString();
+  }
+
   @override
   void close({bool force = false}) {
-    _connectionMgr.close(force: force);
+    connectionManager.close(force: force);
+  }
+}
+
+/// The exception when a connected socket for the [uri]
+/// does not support HTTP/2.
+class DioH2NotSupportedException extends SocketException {
+  const DioH2NotSupportedException(
+    this.uri,
+    this.selectedProtocol,
+  ) : super('h2 protocol not supported');
+
+  final Uri uri;
+  final String? selectedProtocol;
+
+  @override
+  String toString() {
+    final sb = StringBuffer();
+    sb.write('DioH2NotSupportedException');
+    if (message.isNotEmpty) {
+      sb.write(': $message');
+      if (osError != null) {
+        sb.write(' ($osError)');
+      }
+    } else if (osError != null) {
+      sb.write(': $osError');
+    }
+    if (address != null) {
+      sb.write(', address = ${address!.host}');
+    }
+    if (port != null) {
+      sb.write(', port = $port');
+    }
+    return sb.toString();
   }
 }

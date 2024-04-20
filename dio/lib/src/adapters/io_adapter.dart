@@ -189,11 +189,9 @@ class IOHttpClientAdapter implements HttpClientAdapter {
         port,
       );
       if (!isCertApproved) {
-        throw DioException(
+        throw DioException.badCertificate(
           requestOptions: options,
-          type: DioExceptionType.badCertificate,
           error: responseStream.certificate,
-          message: 'The certificate of the response is not approved.',
         );
       }
     }
@@ -212,9 +210,6 @@ class IOHttpClientAdapter implements HttpClientAdapter {
           .map((e) => RedirectRecord(e.statusCode, e.method, e.location))
           .toList(),
       statusMessage: responseStream.reasonPhrase,
-      onClose: () {
-        responseStream.detachSocket().then((socket) => socket.destroy());
-      },
     );
   }
 

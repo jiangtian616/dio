@@ -2,10 +2,9 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
+import 'package:dio_test/util.dart';
 import 'package:dio/src/response/response_stream_handler.dart';
 import 'package:test/test.dart';
-
-import '../utils.dart';
 
 void main() {
   group(handleResponseStream, () {
@@ -233,6 +232,35 @@ void main() {
       await Future.delayed(Duration(milliseconds: 100), () {
         expect(source.hasListener, isFalse);
       });
+    });
+
+    test('not watching the receive timeout after cancelled', () async {
+      bool timerCancelled = false;
+      final cancelToken = CancelToken();
+      final stream = handleResponseStream(
+        RequestOptions(
+          cancelToken: cancelToken,
+          receiveTimeout: Duration(seconds: 1),
+        ),
+        ResponseBody(source.stream, 200),
+        onReceiveTimeoutWatchCancelled: () => timerCancelled = true,
+      );
+      expect(source.hasListener, isTrue);
+      expectLater(
+        stream,
+        emitsInOrder([
+          Uint8List.fromList([0]),
+          emitsError(matchesDioException(
+            DioExceptionType.cancel,
+            stackTraceContains: 'test/response/response_stream_test.dart',
+          )),
+          emitsDone,
+        ]),
+      );
+      source.add(Uint8List.fromList([0]));
+      cancelToken.cancel();
+      await Future.microtask(() {});
+      expect(timerCancelled, isTrue);
     });
   });
 }

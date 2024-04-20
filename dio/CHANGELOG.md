@@ -5,10 +5,36 @@ See the [Migration Guide][] for the complete breaking changes list.**
 
 ## Unreleased
 
+- Raise the min Dart SDK version to 2.18.0.
+- Add constructor for `DioExceptionType.badCertificate`.
+
+## 5.4.3+1
+
+- Fix type promotions for the UTF-8 encoder on previous Dart SDKs.
+
+## 5.4.3
+
+- Remove sockets detach in `IOHttpClientAdapter`.
+- Allows to define `FormData.boundaryName` instead of the default `--dio-boundary-`.
+
+## 5.4.2+1
+
+- Revert "Catch sync/async exceptions in interceptors' handlers".
+
+## 5.4.2
+
+- Fix `receiveTimeout` throws exception after the request has been cancelled.
+- Catch sync/async exceptions in interceptors' handlers.
+- Throws precise `StateError` for handler's duplicated calls.
+
+## 5.4.1
+
 - Provide fix suggestions for `dart fix`.
 - Fix `receiveTimeout` for streamed responses.
 - Fix cancellation for streamed responses and downloads when using `IOHttpClientAdapter`.
 - Fix receive progress for streamed responses and downloads when using `IOHttpClientAdapter`.
+- Support relative `baseUrl` on the Web platform.
+- Avoid fake uncaught exceptions during debugging with IDEs.
 
 ## 5.4.0
 
